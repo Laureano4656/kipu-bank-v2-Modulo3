@@ -48,7 +48,6 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         uint256 usdValue6
     );
     event BankCapUpdated(uint256 oldUsd6, uint256 newUsd6);
-    event MaxWithdrawForTokenUpdated(address token, uint256 maxPerTx);
 
     /// Constants / immutables
     /// We use USDC-like decimals (6) as internal USD accounting base
@@ -60,11 +59,13 @@ contract KipuBank is AccessControl, ReentrancyGuard {
     uint8 public immutable i_priceFeedDecimals;
 
     /// State: bank cap in USD with 6 decimals (e.g. 100 USDC -> 100 * 10^6)
-    uint256 immutable public s_bankCapUsd6;
+    uint256 public immutable s_bankCapUsd6;
 
     /// Total USD stored (6 decimals) - updated on deposits/withdrawals
     uint256 public s_totalUsdStored6;
 
+    /// Max withdrawal per transaction in USD with 6 decimals (0 = no limit)
+    uint256 public s_maxWithdrawUsd6;
 
     /// Balances[token][user] = raw token units (wei for ETH)
     mapping(address => mapping(address => uint256)) private s_balances;
@@ -77,18 +78,23 @@ contract KipuBank is AccessControl, ReentrancyGuard {
     /// @param admin admin address (granted DEFAULT_ADMIN_ROLE)
     /// @param ethUsdPriceFeed address of Chainlink ETH/USD price feed
     /// @param bankCapUsd6 initial bank cap expressed in USDC decimals (6)
-    constructor(address admin, address ethUsdPriceFeed, uint256 bankCapUsd6) {
+    constructor(
+        address admin,
+        address ethUsdPriceFeed,
+        uint256 bankCapUsd6,
+        uint256 maxWithdrawUsd6
+    ) {
         require(admin != address(0), "admin-zero");
         _grantRole(ADMIN_ROLE, admin);
         i_ethUsdPriceFeed = AggregatorV3Interface(ethUsdPriceFeed);
         i_priceFeedDecimals = i_ethUsdPriceFeed.decimals();
         s_bankCapUsd6 = bankCapUsd6;
+        s_maxWithdrawUsd6 = maxWithdrawUsd6;
     }
 
     // -----------------------------
     // Admin functions
     // -----------------------------
-}
 
     // -----------------------------
     // Deposits
@@ -160,11 +166,14 @@ contract KipuBank is AccessControl, ReentrancyGuard {
                 amount
             );
 
-        uint256 maxPerTx = s_maxWithdrawPerToken[NATIVE_TOKEN];
-        if (maxPerTx > 0 && amount > maxPerTx)
-            revert WithdrawExceedsPerTx(NATIVE_TOKEN, maxPerTx, amount);
-
         uint256 usd6 = _toUsd6(NATIVE_TOKEN, amount);
+
+        if (s_maxWithdrawUsd6 > 0 && usd6 > s_maxWithdrawUsd6)
+            revert WithdrawExceedsPerTx(
+                NATIVE_TOKEN,
+                s_maxWithdrawUsd6,
+                amount
+            );
 
         // effects
         s_balances[NATIVE_TOKEN][msg.sender] = userBal - amount;
@@ -191,11 +200,10 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         if (userBal < amount)
             revert InsufficientBalance(token, msg.sender, userBal, amount);
 
-        uint256 maxPerTx = s_maxWithdrawPerToken[token];
-        if (maxPerTx > 0 && amount > maxPerTx)
-            revert WithdrawExceedsPerTx(token, maxPerTx, amount);
-
         uint256 usd6 = _toUsd6(token, amount);
+
+        if (s_maxWithdrawUsd6 > 0 && usd6 > s_maxWithdrawUsd6)
+            revert WithdrawExceedsPerTx(token, s_maxWithdrawUsd6, amount);
 
         // effects
         s_balances[token][msg.sender] = userBal - amount;
