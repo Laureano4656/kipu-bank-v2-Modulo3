@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-/// @title KipuBank (refactor) - Multi-token vault with USD bank cap and roles
-/// @notice ETH represented as address(0). Uses Chainlink ETH/USD feed for USD valuation.
-/// @dev This contract is a refactor of the original exercise to approach a production-like design.
+/// @title KipuBank - Multi-token vault with USD cap (Option A withdraw rule)
+/// @notice ETH represented as address(0). Uses Chainlink ETH/USD feed to value amounts in USD (6 decimals).
+/// @dev SafeERC20, ReentrancyGuard and AccessControl used.
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 contract KipuBank is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20Metadata;
@@ -29,10 +29,14 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         uint256 available,
         uint256 required
     );
-    error WithdrawExceedsPerTx(address token, uint256 limit, uint256 attempted);
+    error WithdrawExceedsPerTx(
+        address token,
+        uint256 limitUsd6,
+        uint256 attemptedUsd6
+    );
     error NativeTransferFailed(address to, uint256 amount);
-    error TokenReturnFailed(address token, address to, uint256 amount);
     error InvalidPriceFeed();
+    error UnsupportedToken();
 
     /// Events
     event Deposit(
@@ -48,24 +52,20 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         uint256 usdValue6
     );
     event BankCapUpdated(uint256 oldUsd6, uint256 newUsd6);
+    event ChainlinkFeedUpdated(address oldFeed, address newFeed);
+    event MaxWithdrawUsd6Updated(uint256 oldUsd6, uint256 newUsd6);
 
     /// Constants / immutables
-    /// We use USDC-like decimals (6) as internal USD accounting base
-    uint8 public constant USDC_DECIMALS = 6;
+    uint8 public constant USDC_DECIMALS = 6; // internal USD base
     address public constant NATIVE_TOKEN = address(0);
 
-    /// Chainlink ETH/USD feed (immutable)
-    AggregatorV3Interface public immutable i_ethUsdPriceFeed;
-    uint8 public immutable i_priceFeedDecimals;
+    /// Chainlink ETH/USD feed (can be updated by admin)
+    AggregatorV3Interface public i_ethUsdPriceFeed;
 
-    /// State: bank cap in USD with 6 decimals (e.g. 100 USDC -> 100 * 10^6)
-    uint256 public immutable s_bankCapUsd6;
-
-    /// Total USD stored (6 decimals) - updated on deposits/withdrawals
-    uint256 public s_totalUsdStored6;
-
-    /// Max withdrawal per transaction in USD with 6 decimals (0 = no limit)
-    uint256 public s_maxWithdrawUsd6;
+    /// State
+    uint256 public immutable s_bankCapUsd6; // immutable bank cap in USD6 units
+    uint256 public s_totalUsdStored6; // current total value in USD6
+    uint256 public s_maxWithdrawUsd6; // global withdraw limit in USD6 (0 -> disabled)
 
     /// Balances[token][user] = raw token units (wei for ETH)
     mapping(address => mapping(address => uint256)) private s_balances;
@@ -75,36 +75,50 @@ contract KipuBank is AccessControl, ReentrancyGuard {
     uint256 public s_totalWithdrawals;
 
     /// Constructor
-    /// @param admin admin address (granted DEFAULT_ADMIN_ROLE)
-    /// @param ethUsdPriceFeed address of Chainlink ETH/USD price feed
-    /// @param bankCapUsd6 initial bank cap expressed in USDC decimals (6)
+    /// @param admin admin address to grant DEFAULT_ADMIN_ROLE
+    /// @param ethUsdPriceFeed Chainlink ETH/USD aggregator address
+    /// @param bankCapUsd6 bank cap expressed in USD with 6 decimals (USDC-style)
+    /// @param maxWithdrawUsd6 max withdraw per tx in USD6 (0 = no limit)
     constructor(
         address admin,
         address ethUsdPriceFeed,
         uint256 bankCapUsd6,
         uint256 maxWithdrawUsd6
     ) {
-        require(admin != address(0), "admin-zero");
         _grantRole(ADMIN_ROLE, admin);
         i_ethUsdPriceFeed = AggregatorV3Interface(ethUsdPriceFeed);
-        i_priceFeedDecimals = i_ethUsdPriceFeed.decimals();
         s_bankCapUsd6 = bankCapUsd6;
         s_maxWithdrawUsd6 = maxWithdrawUsd6;
     }
 
     // -----------------------------
-    // Admin functions
+    // Admin
     // -----------------------------
+
+    /// @notice Update Chainlink ETH/USD feed (admin)
+    function setChainlinkFeed(address newFeed) external onlyRole(ADMIN_ROLE) {
+        address old = address(i_ethUsdPriceFeed);
+        i_ethUsdPriceFeed = AggregatorV3Interface(newFeed);
+        emit ChainlinkFeedUpdated(old, newFeed);
+    }
+
+    /// @notice Update global max withdraw in USD6
+    function setMaxWithdrawUsd6(
+        uint256 newMaxUsd6
+    ) external onlyRole(ADMIN_ROLE) {
+        uint256 old = s_maxWithdrawUsd6;
+        s_maxWithdrawUsd6 = newMaxUsd6;
+        emit MaxWithdrawUsd6Updated(old, newMaxUsd6);
+    }
 
     // -----------------------------
     // Deposits
     // -----------------------------
 
-    /// @notice Deposit native ETH into the sender's vault
+    /// @notice Deposit native ETH into sender vault
     function depositETH() external payable nonReentrant {
         if (msg.value == 0) revert ZeroAmount();
 
-        // compute USD value (6 decimals) for the amount
         uint256 usd6 = _toUsd6(NATIVE_TOKEN, msg.value);
 
         uint256 newTotalUsd6 = s_totalUsdStored6 + usd6;
@@ -121,27 +135,28 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         emit Deposit(NATIVE_TOKEN, msg.sender, msg.value, usd6);
     }
 
-    /// @notice Deposit an ERC20 token (token must implement decimals())
+    /// @notice Deposit ERC20 token into sender vault (token must implement decimals())
+    /// @dev Compute USD value and check cap BEFORE pulling tokens to avoid returning them.
     function depositToken(address token, uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        if (token == NATIVE_TOKEN) revert();
+        if (token == NATIVE_TOKEN) {
+            depositETH();
+            return;
+        }
 
-        // pull tokens
+        uint256 usd6 = _toUsd6(token, amount);
+        uint256 newTotalUsd6 = s_totalUsdStored6 + usd6;
+        if (newTotalUsd6 > s_bankCapUsd6)
+            revert DepositExceedsBankCap(s_bankCapUsd6, newTotalUsd6);
+
+        // pull tokens after cap check
         IERC20Metadata(token).safeTransferFrom(
             msg.sender,
             address(this),
             amount
         );
 
-        uint256 usd6 = _toUsd6(token, amount);
-        uint256 newTotalUsd6 = s_totalUsdStored6 + usd6;
-        if (newTotalUsd6 > s_bankCapUsd6) {
-            // Attempt to return tokens to sender, then revert.
-            // safeTransfer will revert on failure.
-            IERC20Metadata(token).safeTransfer(msg.sender, amount);
-            revert DepositExceedsBankCap(s_bankCapUsd6, newTotalUsd6);
-        }
-
+        // effects
         s_balances[token][msg.sender] += amount;
         s_totalUsdStored6 = newTotalUsd6;
         unchecked {
@@ -152,9 +167,10 @@ contract KipuBank is AccessControl, ReentrancyGuard {
     }
 
     // -----------------------------
-    // Withdrawals
+    // Withdrawals (Option A: global USD limit applied)
     // -----------------------------
 
+    /// @notice Withdraw native ETH
     function withdrawETH(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         uint256 userBal = s_balances[NATIVE_TOKEN][msg.sender];
@@ -167,13 +183,8 @@ contract KipuBank is AccessControl, ReentrancyGuard {
             );
 
         uint256 usd6 = _toUsd6(NATIVE_TOKEN, amount);
-
         if (s_maxWithdrawUsd6 > 0 && usd6 > s_maxWithdrawUsd6)
-            revert WithdrawExceedsPerTx(
-                NATIVE_TOKEN,
-                s_maxWithdrawUsd6,
-                amount
-            );
+            revert WithdrawExceedsPerTx(NATIVE_TOKEN, s_maxWithdrawUsd6, usd6);
 
         // effects
         s_balances[NATIVE_TOKEN][msg.sender] = userBal - amount;
@@ -189,6 +200,7 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         emit Withdrawal(NATIVE_TOKEN, msg.sender, amount, usd6);
     }
 
+    /// @notice Withdraw ERC20 token
     function withdrawToken(
         address token,
         uint256 amount
@@ -201,9 +213,8 @@ contract KipuBank is AccessControl, ReentrancyGuard {
             revert InsufficientBalance(token, msg.sender, userBal, amount);
 
         uint256 usd6 = _toUsd6(token, amount);
-
         if (s_maxWithdrawUsd6 > 0 && usd6 > s_maxWithdrawUsd6)
-            revert WithdrawExceedsPerTx(token, s_maxWithdrawUsd6, amount);
+            revert WithdrawExceedsPerTx(token, s_maxWithdrawUsd6, usd6);
 
         // effects
         s_balances[token][msg.sender] = userBal - amount;
@@ -221,6 +232,7 @@ contract KipuBank is AccessControl, ReentrancyGuard {
     // -----------------------------
     // Views
     // -----------------------------
+
     function getTokenBalance(
         address token,
         address user
@@ -240,44 +252,42 @@ contract KipuBank is AccessControl, ReentrancyGuard {
     }
 
     // -----------------------------
-    // Internal valuation helper
+    // Internal helper: convert amount -> USD6 using ETH/USD feed
     // -----------------------------
-    /// @dev Convert a token amount to USD with 6 decimals (USDC style).
-    /// For ETH (address(0)) uses Chainlink ETH/USD feed. For tokens we assume token is priced in ETH.
+    /// @dev Converts token amount to USD with 6 decimals (USDC style).
+    ///      Note: This function uses the ETH/USD feed. It assumes token is valued relative to ETH.
     function _toUsd6(
         address token,
         uint256 amount
     ) internal view returns (uint256) {
-        // get price (ETH / USD)
-        (, int256 price, , , ) = i_ethUsdPriceFeed.latestRoundData();
-        if (price <= 0) revert InvalidPriceFeed();
-        uint256 priceUint = uint256(price); // price units = 10 ^ i_priceFeedDecimals
+        // read ETH/USD price
+        (, int256 priceInt, , , ) = i_ethUsdPriceFeed.latestRoundData();
+        if (priceInt <= 0) revert InvalidPriceFeed();
+        uint256 price = uint256(priceInt);
+        uint8 priceDecimals = i_ethUsdPriceFeed.decimals();
 
-        // token decimals
         uint8 tokenDecimals = token == NATIVE_TOKEN
             ? 18
             : IERC20Metadata(token).decimals();
 
-        // Calculation:
-        // usd6 = amount * priceUint * 10^USDC_DECIMALS / (10^tokenDecimals * 10^priceDecimals)
-        // Do multiplication in safe order to avoid truncation as much as possible.
-        // scaled = amount * priceUint
-        uint256 scaled = amount * priceUint; // ok in 256 bits for reasonable amounts
-        uint256 denom = (10 ** tokenDecimals) * (10 ** i_priceFeedDecimals);
-        uint256 usd6 = (scaled * (10 ** USDC_DECIMALS)) / denom;
+        // usd6 = amount * price * 10^USDC_DECIMALS / (10^tokenDecimals * 10^priceDecimals)
+        // Avoid intermediate truncation: promote exponents to uint256
+        uint256 scaled = amount * price; // amount * price
+        uint256 denom = (10 ** uint256(tokenDecimals)) *
+            (10 ** uint256(priceDecimals));
+        uint256 usd6 = (scaled * (10 ** uint256(USDC_DECIMALS))) / denom;
         return usd6;
     }
 
     // -----------------------------
-    // Fallback/receive: force explicit deposit function use or route to depositETH
+    // Fallback / receive
     // -----------------------------
+    // Force explicit deposit function usage to keep accounting correct.
     receive() external payable {
-        // route to depositETH so accounting is consistent
-        this.depositETH();
+        depositETH();
     }
 
     fallback() external payable {
-        // route to depositETH for plain ETH transfers (or revert if you prefer)
-        this.depositETH();
+        depositETH();
     }
 }
